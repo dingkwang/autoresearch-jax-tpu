@@ -259,12 +259,12 @@ WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 DEPTH = 8
-DEVICE_BATCH_SIZE = 8
+DEVICE_BATCH_SIZE = 16
 SEQ_LEN = 512
 
 # Optimizer selection: True = Muon (2D weights) + AdamW (embeddings/1D)
 #                      False = AdamW only (baseline)
-USE_MUON = True
+USE_MUON = False
 MUON_LR = 2e-2          # Muon converges well with higher LR
 ADAMW_LR = 3e-3         # AdamW baseline LR
 
