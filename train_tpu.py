@@ -250,177 +250,161 @@ def evaluate_bpb_jax(model, params, tokenizer, batch_size, token_bytes, eval_fn)
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 64           # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern (not used with SDPA fallback)
-
-# Optimization
-TOTAL_BATCH_SIZE = 2**16 # ~65K tokens per optimizer step
-PEAK_LR = 3e-3          # peak learning rate
-WEIGHT_DECAY = 0.1      # AdamW weight decay
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
-
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 8   # per-device batch size (reduce if OOM)
-SEQ_LEN = 512           # sequence length (reduced for TPU memory)
+WINDOW_PATTERN = "SSSL"
+TOTAL_BATCH_SIZE = 2**16
+PEAK_LR = 3e-3
+WEIGHT_DECAY = 0.1
+WARMUP_RATIO = 0.0
+WARMDOWN_RATIO = 0.5
+FINAL_LR_FRAC = 0.0
+DEPTH = 8
+DEVICE_BATCH_SIZE = 8
+SEQ_LEN = 512
 
 # ---------------------------------------------------------------------------
-# Setup
+# Training entry point
 # ---------------------------------------------------------------------------
 
-t_start = time.time()
+def main(log_file=None):
+    """Run training. If log_file is given, all output goes there (no stdout).
+    This lets callers run training in a background thread without blocking Jupyter."""
+    import sys
 
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
-
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
-    )
-
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
-
-model = GPT(config=config)
-key = jax.random.PRNGKey(42)
-dummy = jnp.ones((DEVICE_BATCH_SIZE, SEQ_LEN), dtype=jnp.int32)
-params = model.init(key, dummy, dummy)
-
-param_count = sum(p.size for p in jax.tree.leaves(params))
-print(f"Total parameters: {param_count:,}")
-
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * SEQ_LEN
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-print(f"Gradient accumulation steps: {grad_accum_steps}")
-
-# Optimizer
-optimizer = optax.adamw(learning_rate=PEAK_LR, weight_decay=WEIGHT_DECAY)
-opt_state = optimizer.init(params)
-
-# JIT-compiled train step
-@jax.jit
-def train_step(params, opt_state, x, y):
-    def loss_fn(p):
-        return model.apply(p, x, y)
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    updates, new_opt_state = optimizer.update(grads, opt_state, params)
-    new_params = optax.apply_updates(params, updates)
-    return new_params, new_opt_state, loss
-
-# JIT-compiled eval step
-token_bytes = get_token_bytes_jax()
-
-@jax.jit
-def eval_step(params, x, y, token_bytes):
-    logits = model.apply(params, x)
-    logits = logits.astype(jnp.float32)
-    loss_flat = optax.softmax_cross_entropy_with_integer_labels(logits, y).reshape(-1)
-    y_flat = y.reshape(-1)
-    nbytes = token_bytes[y_flat]
-    mask = (nbytes > 0).astype(jnp.float32)
-    nats = jnp.sum(loss_flat * mask)
-    total_bytes = jnp.sum(nbytes)
-    return nats, total_bytes
-
-# Dataloader
-train_loader = make_dataloader_jax(tokenizer, DEVICE_BATCH_SIZE, SEQ_LEN, "train")
-
-# Warmup JIT compilation
-print("Compiling JIT...")
-x, y, _ = next(train_loader)
-params, opt_state, loss = train_step(params, opt_state, x, y)
-loss.block_until_ready()
-print("JIT compilation done.")
-
-# LR schedule
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
+    if log_file:
+        _f = open(log_file, 'w')
+        def p(s):
+            _f.write(s + '\n')
+            _f.flush()
     else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown + (1 - cooldown) * FINAL_LR_FRAC
+        def p(s):
+            print(s, flush=True)
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
+    try:
+        t_start = time.time()
 
-print(f"\nStarting training (time budget: {TIME_BUDGET}s)...")
-t_start_training = time.time()
-total_training_time = 0
-step = 1
-smooth_loss = 0
+        tokenizer = Tokenizer.from_directory()
+        vocab_size = tokenizer.get_vocab_size()
+        p(f"Vocab size: {vocab_size:,}")
 
-while True:
-    t0 = time.time()
+        base_dim = DEPTH * ASPECT_RATIO
+        model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
+        num_heads = model_dim // HEAD_DIM
+        config = GPTConfig(
+            sequence_len=SEQ_LEN, vocab_size=vocab_size,
+            n_layer=DEPTH, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+            window_pattern=WINDOW_PATTERN,
+        )
+        p(f"Model config: {asdict(config)}")
 
-    x, y, epoch = next(train_loader)
-    params, opt_state, loss = train_step(params, opt_state, x, y)
-    loss.block_until_ready()
+        model = GPT(config=config)
+        key = jax.random.PRNGKey(42)
+        dummy = jnp.ones((DEVICE_BATCH_SIZE, SEQ_LEN), dtype=jnp.int32)
+        params = model.init(key, dummy, dummy)
 
-    t1 = time.time()
-    dt = t1 - t0
+        param_count = sum(x.size for x in jax.tree.leaves(params))
+        p(f"Total parameters: {param_count:,}")
 
-    if step > 10:
-        total_training_time += dt
+        optimizer = optax.adamw(learning_rate=PEAK_LR, weight_decay=WEIGHT_DECAY)
+        opt_state = optimizer.init(params)
 
-    loss_f = loss.item()
+        @jax.jit
+        def train_step(params, opt_state, x, y):
+            loss, grads = jax.value_and_grad(lambda p: model.apply(p, x, y))(params)
+            updates, new_opt_state = optimizer.update(grads, opt_state, params)
+            return optax.apply_updates(params, updates), new_opt_state, loss
 
-    # Fast fail
-    if math.isnan(loss_f) or loss_f > 100:
-        print("FAIL")
-        exit(1)
+        token_bytes = get_token_bytes_jax()
 
-    # Logging
-    ema_beta = 0.95
-    smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_f
-    debiased = smooth_loss / (1 - ema_beta ** step)
+        @jax.jit
+        def eval_step(params, x, y, token_bytes):
+            logits = model.apply(params, x).astype(jnp.float32)
+            loss_flat = optax.softmax_cross_entropy_with_integer_labels(logits, y).reshape(-1)
+            y_flat = y.reshape(-1)
+            nbytes = token_bytes[y_flat]
+            mask = (nbytes > 0).astype(jnp.float32)
+            return jnp.sum(loss_flat * mask), jnp.sum(nbytes)
 
-    if step % 50 == 0:
-        progress = min(total_training_time / TIME_BUDGET, 1.0)
-        tok_per_sec = int(DEVICE_BATCH_SIZE * SEQ_LEN / dt)
-        remaining = max(0, TIME_BUDGET - total_training_time)
-        pct = 100 * progress
-        print(f"step {step:05d} ({pct:.1f}%) | loss: {debiased:.4f} | dt: {dt*1000:.0f}ms | tok/s: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s")
+        train_loader = make_dataloader_jax(tokenizer, DEVICE_BATCH_SIZE, SEQ_LEN, "train")
 
-    # GC management
-    if step == 1:
-        gc.collect()
-        gc.disable()
+        p("Compiling JIT...")
+        x, y, _ = next(train_loader)
+        params, opt_state, loss = train_step(params, opt_state, x, y)
+        loss.block_until_ready()
+        p("JIT done. Starting training...")
 
-    step += 1
+        def get_lr_multiplier(progress):
+            if progress < WARMUP_RATIO:
+                return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+            elif progress < 1.0 - WARMDOWN_RATIO:
+                return 1.0
+            else:
+                cooldown = (1.0 - progress) / WARMDOWN_RATIO
+                return cooldown + (1 - cooldown) * FINAL_LR_FRAC
 
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
+        t_start_training = time.time()
+        total_training_time = 0
+        step = 1
+        smooth_loss = 0
 
-print()
-total_tokens = step * DEVICE_BATCH_SIZE * SEQ_LEN
+        while True:
+            t0 = time.time()
+            x, y, epoch = next(train_loader)
+            params, opt_state, loss = train_step(params, opt_state, x, y)
+            loss.block_until_ready()
+            dt = time.time() - t0
 
-# ---------------------------------------------------------------------------
-# Final evaluation
-# ---------------------------------------------------------------------------
+            if step > 10:
+                total_training_time += dt
 
-print("Evaluating val_bpb...")
-val_bpb = evaluate_bpb_jax(model, params, tokenizer, DEVICE_BATCH_SIZE, token_bytes, eval_step)
+            loss_f = loss.item()
+            if math.isnan(loss_f) or loss_f > 100:
+                p("FAIL: loss exploded")
+                return
 
-t_end = time.time()
+            ema_beta = 0.95
+            smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_f
+            debiased = smooth_loss / (1 - ema_beta ** step)
 
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {param_count / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+            if step % 50 == 0:
+                progress = min(total_training_time / TIME_BUDGET, 1.0)
+                tok_per_sec = int(DEVICE_BATCH_SIZE * SEQ_LEN / dt)
+                remaining = max(0, TIME_BUDGET - total_training_time)
+                p(f"step {step:05d} ({100*progress:.1f}%) | loss: {debiased:.4f} | dt: {dt*1000:.0f}ms | tok/s: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s")
+
+            if step == 1:
+                gc.collect()
+                gc.disable()
+
+            step += 1
+            if step > 10 and total_training_time >= TIME_BUDGET:
+                break
+
+        total_tokens = step * DEVICE_BATCH_SIZE * SEQ_LEN
+
+        p("Evaluating val_bpb...")
+        val_bpb = evaluate_bpb_jax(model, params, tokenizer, DEVICE_BATCH_SIZE, token_bytes, eval_step)
+
+        t_end = time.time()
+        p("---")
+        p(f"val_bpb:          {val_bpb:.6f}")
+        p(f"training_seconds: {total_training_time:.1f}")
+        p(f"total_seconds:    {t_end - t_start:.1f}")
+        p(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
+        p(f"num_steps:        {step}")
+        p(f"num_params_M:     {param_count / 1e6:.1f}")
+        p(f"depth:            {DEPTH}")
+        p("DONE")
+
+    except Exception as e:
+        import traceback
+        p(f"FAIL: {e}")
+        p(traceback.format_exc())
+    finally:
+        if log_file:
+            _f.close()
+
+
+if __name__ == "__main__":
+    main()
