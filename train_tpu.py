@@ -107,8 +107,11 @@ class MLP(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(4 * self.n_embd, use_bias=False, name='c_fc')(x)
-        x = jax.nn.relu(x) ** 2  # relu-squared
+        # SwiGLU with iso-param intermediate dim: 8/3 * n_embd, rounded to 64
+        intermediate = ((8 * self.n_embd // 3 + 63) // 64) * 64
+        h = nn.Dense(2 * intermediate, use_bias=False, name='c_fc')(x)
+        gate, val = jnp.split(h, 2, axis=-1)
+        x = jax.nn.silu(gate) * val
         x = nn.Dense(self.n_embd, use_bias=False, name='c_proj')(x)
         return x
 
