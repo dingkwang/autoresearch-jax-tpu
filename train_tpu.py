@@ -272,19 +272,39 @@ ADAMW_LR = 3e-3         # AdamW baseline LR
 # Training entry point
 # ---------------------------------------------------------------------------
 
-def main(log_file=None):
+def main(log_file=None, wandb_run_name=None):
     """Run training. If log_file is given, all output goes there (no stdout).
-    This lets callers run training in a background thread without blocking Jupyter."""
+    This lets callers run training in a background thread without blocking Jupyter.
+    If WANDB_API_KEY is set, logs metrics to W&B project 'autoresearch-jax-tpu'."""
     import sys
 
-    if log_file:
-        _f = open(log_file, 'w')
-        def p(s):
+    _f = open(log_file, 'w') if log_file else None
+    def p(s):
+        if _f:
             _f.write(s + '\n')
             _f.flush()
-    else:
-        def p(s):
+        else:
             print(s, flush=True)
+
+    # W&B setup — optional, gracefully skipped if unavailable or no API key
+    wb = None
+    try:
+        import wandb, os
+        if os.environ.get('WANDB_API_KEY'):
+            wb = wandb.init(
+                project='autoresearch-jax-tpu',
+                name=wandb_run_name,
+                config=dict(
+                    depth=DEPTH, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
+                    seq_len=SEQ_LEN, device_batch_size=DEVICE_BATCH_SIZE,
+                    adamw_lr=ADAMW_LR, muon_lr=MUON_LR, use_muon=USE_MUON,
+                    weight_decay=WEIGHT_DECAY, warmdown_ratio=WARMDOWN_RATIO,
+                ),
+                reinit=True,
+            )
+            p(f"W&B run: {wb.url}")
+    except Exception as e:
+        p(f"W&B disabled: {e}")
 
     try:
         t_start = time.time()
@@ -392,6 +412,9 @@ def main(log_file=None):
                 tok_per_sec = int(DEVICE_BATCH_SIZE * SEQ_LEN / dt)
                 remaining = max(0, TIME_BUDGET - total_training_time)
                 p(f"step {step:05d} ({100*progress:.1f}%) | loss: {debiased:.4f} | dt: {dt*1000:.0f}ms | tok/s: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s")
+                if wb:
+                    wb.log({"train/loss": debiased, "train/tok_per_sec": tok_per_sec,
+                            "train/progress": progress, "train/remaining_s": remaining}, step=step)
 
             if step == 1:
                 gc.collect()
@@ -416,13 +439,19 @@ def main(log_file=None):
         p(f"num_params_M:     {param_count / 1e6:.1f}")
         p(f"depth:            {DEPTH}")
         p("DONE")
+        if wb:
+            wb.log({"val/bpb": val_bpb, "total_tokens_M": total_tokens / 1e6,
+                    "num_params_M": param_count / 1e6})
+            wb.finish()
 
     except Exception as e:
         import traceback
         p(f"FAIL: {e}")
         p(traceback.format_exc())
+        if wb:
+            wb.finish(exit_code=1)
     finally:
-        if log_file:
+        if _f is not None:
             _f.close()
 
 
