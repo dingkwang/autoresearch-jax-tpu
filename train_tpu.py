@@ -254,7 +254,7 @@ ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 64           # target head dimension for attention
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = 2**16
-PEAK_LR = 3e-3
+PEAK_LR = 2e-2          # Muon works well with higher LR than AdamW
 WEIGHT_DECAY = 0.1
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.5
@@ -306,7 +306,21 @@ def main(log_file=None):
         param_count = sum(x.size for x in jax.tree.leaves(params))
         p(f"Total parameters: {param_count:,}")
 
-        optimizer = optax.adamw(learning_rate=PEAK_LR, weight_decay=WEIGHT_DECAY)
+        # Muon for 2D weights (linear layers), AdamW for everything else
+        # (embeddings, 1D params like resid_lambdas, x0_lambdas)
+        def param_labels(params):
+            def label_leaf(path, _):
+                # path is a tuple of keys; use 2D shape check at update time instead
+                return 'muon' if len(path) > 0 and 'kernel' in str(path[-1]) else 'adamw'
+            return jax.tree_util.tree_map_with_path(label_leaf, params)
+
+        optimizer = optax.multi_transform(
+            {
+                'muon': optax.contrib.muon(learning_rate=PEAK_LR, momentum=0.95, nesterov=True),
+                'adamw': optax.adamw(learning_rate=PEAK_LR, weight_decay=WEIGHT_DECAY),
+            },
+            param_labels(params),
+        )
         opt_state = optimizer.init(params)
 
         @jax.jit
