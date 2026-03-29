@@ -413,8 +413,11 @@ def main(log_file=None, wandb_run_name=None):
                 remaining = max(0, TIME_BUDGET - total_training_time)
                 p(f"step {step:05d} ({100*progress:.1f}%) | loss: {debiased:.4f} | dt: {dt*1000:.0f}ms | tok/s: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s")
                 if wb:
-                    wb.log({"train/loss": debiased, "train/tok_per_sec": tok_per_sec,
-                            "train/progress": progress, "train/remaining_s": remaining}, step=step)
+                    # Fire-and-forget to avoid blocking the training loop on network I/O
+                    import threading as _t
+                    _t.Thread(target=wb.log, kwargs={"data": {"train/loss": debiased,
+                        "train/tok_per_sec": tok_per_sec, "train/progress": progress,
+                        "train/remaining_s": remaining}, "step": step}, daemon=True).start()
 
             if step == 1:
                 gc.collect()
