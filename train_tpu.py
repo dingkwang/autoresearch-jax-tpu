@@ -266,7 +266,7 @@ SEQ_LEN = 512
 #                      False = AdamW only (baseline)
 USE_MUON = False
 MUON_LR = 2e-2          # Muon converges well with higher LR
-ADAMW_LR = 6e-3         # higher LR for batch=16 (linear scaling rule)
+ADAMW_LR = 3e-3         # AdamW baseline LR
 
 # ---------------------------------------------------------------------------
 # Training entry point
